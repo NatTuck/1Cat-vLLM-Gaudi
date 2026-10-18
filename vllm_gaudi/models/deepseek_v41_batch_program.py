@@ -14,7 +14,13 @@ class PreparedBatchLayerGroup(nn.Module):
             raise ValueError("Request batches use ordinary decode, not draft positions")
         self.layers = nn.ModuleList(list(stage.layers[start:stop]))
         self.input = PreparedInput(stage.weights.embed, stage.tp_rank, stage.reduce) if text_input else None
-        self.final = stage.pp_rank == 1 and stop == len(stage.layers)
+        # The tail belongs to the *last* stage, not literally to pp_rank 1: on a
+        # single-stage deployment pp_rank is 0 and this group also owns the head
+        # input, so keying on the literal rank left the (b,4,5120) residual
+        # uncollapsed and fed a 3-D tensor to the 2-D-only head projection.
+        # Mirror PreparedLayerGroup (deepseek_v41_program.py:3128).
+        is_last_stage = getattr(stage, "is_last_stage", stage.pp_rank == 1)
+        self.final = is_last_stage and stop == len(stage.layers)
         self.norm = stage.weights.norm if self.final else None
         config = stage.config["text_config"]
         self.eps = config["rms_norm_eps"]

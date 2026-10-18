@@ -56,8 +56,17 @@ class BatchStageVariant(torch.nn.Module):
         if self.bucket not in (1, 2, 4, 8, 16, 32, 64):
             raise ValueError("Unsupported native request bucket")
         base = DEEPSEEK_V41_PP0_INPUT if program.pp_rank == 0 else DEEPSEEK_V41_PP1
+        # The module constants carry a five-group topology (20 layers). This model
+        # has 40, so CompiledBatchStage builds ten chunks and _flush never sees
+        # len(plans) == full_groups: it replays prepared groups but never captures,
+        # so require_ready can never pass. Derive the group count from the stage,
+        # as the ordinary C1 owner already does (deepseek_v41_replay.py:266).
+        layers = len(program.layers)
+        if layers % 4:
+            raise ValueError("Native V4.1 stage requires complete four-layer groups")
         self.adapter = replace(base,
                                name=f"deepseek_v41_pp{program.pp_rank}_request_batch",
+                               group_layers=(4,) * (layers // 4),
                                extra_collectives=base.extra_collectives +
                                sum(2 for layer in program.layers if layer.attention.owns_index))
         self.compiled = CompiledBatchStage(program, text_input=program.pp_rank == 0)
