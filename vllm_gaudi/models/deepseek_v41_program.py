@@ -793,7 +793,13 @@ class PreparedMoE(nn.Module):
             channel2 = experts.w2_fp8_channel
             if not isinstance(channel13, torch.Tensor) or not isinstance(channel2, torch.Tensor):
                 raise TypeError("N256 FP8 channel scales were not loaded as tensors")
-            if self.tensor_parallel_size == 4 and use_fused and tile_prequant is None:
+            # `ordinary_decode` makes `use_fused` true at every row count, but the
+            # Fused N256 body behind run_fused_decode is C1-C6 by contract. Keep the
+            # bucket-8/16 rows off it: they fall through to the op chain below, which at
+            # default flags selects custom_..._moe_fused_reduce_fp8_gaudi2 (validated
+            # 1..64 rows) rather than the generic body (validated 1..16384).
+            if (self.tensor_parallel_size == 4 and use_fused and tile_prequant is None
+                    and tile_value.shape[0] <= 6):
                 from vllm_gaudi.ops.deepseek_v41_expert_n256 import run_fused_decode
 
                 return run_fused_decode(

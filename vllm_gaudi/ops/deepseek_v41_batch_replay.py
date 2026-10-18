@@ -196,8 +196,18 @@ class BatchStageReplay:
         return self.variants[bucket](hidden, pre, positions, ids, engram, slots, pages, host_positions=host_positions)
 
     def require_ready(self, bucket):
-        from vllm_gaudi.ops.tp2_prepared_plan import _native_entries
-        if self.variants.get(bucket) not in _native_entries:
+        """A bucket that uses the native path must be prepared; one that does not, need not be.
+
+        Buckets wider than the HCL TP4 native exchange are deliberately not captured
+        natively (tp2_prepared_plan._eligible rejects them) and run through the compiled
+        groups instead, so their absence from _native_entries is a legitimate state
+        rather than a missing preparation.
+        """
+        from vllm_gaudi.ops.tp2_prepared_plan import _native_entries, native_exchange_fits
+        variant = self.variants.get(bucket)
+        if variant is not None and not native_exchange_fits(bucket * variant.fixed[0].shape[-1]):
+            return
+        if variant not in _native_entries:
             raise RuntimeError(f"Native request bucket {bucket} has not completed preparation")
 
     def close(self):

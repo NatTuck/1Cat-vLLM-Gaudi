@@ -457,6 +457,20 @@ def _is_clear(target):
     )
 
 
+# HCL's TP4 native exchange graph rejects a payload above this many BF16 elements:
+# src/hcl/hcl/src/hccl/hccl.cpp, hcclTp4NativeGraphCreate returns hcclInvalidArgument for
+# `count > 32768`, and the bridge passes the flattened [1, rows * hidden] payload. This is
+# the single source of truth for how wide a bucket the native exchange can carry (6 rows at
+# hidden 5120); it is consulted both when deciding eligibility and when checking that a
+# bucket was prepared. Do not restate the number anywhere else.
+NATIVE_EXCHANGE_ELEMENTS = 32768
+
+
+def native_exchange_fits(elements):
+    """True when one native TP4 exchange can carry a payload of this many elements."""
+    return 0 < elements <= NATIVE_EXCHANGE_ELEMENTS
+
+
 def _view_targets():
     return (torch.ops.aten.view.default, torch.ops.aten.as_strided.default)
 
@@ -537,6 +551,7 @@ def _is_static_scalar(node):
 
 def _eligible(graph, *, tp4=False):
     from vllm_gaudi import envs as gaudi_envs
+    v4 = tp4 or gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY
 
     if not tp4 and (gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY):
         context = getattr(_local, "native_context", None)
@@ -585,9 +600,30 @@ def _eligible(graph, *, tp4=False):
                     and value.numel() % 4
                 ):
                     return False
+    elif v4:
+        # HCL's TP4 native exchange graph rejects a payload above 32768 BF16 elements
+        # (src/hcl/hcl/src/hccl/hccl.cpp: hcclTp4NativeGraphCreate returns
+        # hcclInvalidArgument for count > 32768). Every collective on this path carries
+        # its flattened [1, rows * hidden] payload in args[0], so at hidden 5120 that is
+        # a rows <= 6 qualification. The tp4 block above states the intent - "wider
+        # buckets remain ordinary compiled execution until their ownership and
+        # scheduling contract is qualified separately" - but it only ran when tp4 was
+        # requested, and the V4.1 pass calls _eligible() without it, so bucket 8 was
+        # declared eligible and handed to HCL, which rejected it. Rejecting here routes
+        # those buckets to ordinary compiled execution instead.
+        for node in graph.graph.nodes:
+            if node.target not in targets:
+                continue
+            value = node.args[0].meta.get("val")
+            if isinstance(value, torch.Tensor) and not native_exchange_fits(value.numel()):
+                from vllm_gaudi.extension.logger import logger as _init_logger
+                _init_logger().info(
+                    "V4.1 native group ineligible: collective payload %d exceeds %d elements "
+                    "(bucket too wide for the HCL TP4 exchange); ordinary compiled execution",
+                    value.numel(), NATIVE_EXCHANGE_ELEMENTS)
+                return False
     # V1 only captures groups already qualified for destination-bound GDN.
     # Ordinary/reference groups retain the normal compiler execution path.
-    v4 = tp4 or gaudi_envs.VLLM_HPU_DSV4_NATIVE_DECODE_GRAPH or gaudi_envs.VLLM_HPU_DSV41_GRAPH_REPLAY
     native = None if v4 else torch.ops.custom_op.gdn_state_update_out.default
     if not v4 and not any(
         child.op == "call_function" and child.target == native
