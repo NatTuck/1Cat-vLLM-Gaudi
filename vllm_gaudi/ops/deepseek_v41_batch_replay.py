@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Finite ordinary-request batch graphs, with request-owned state capture."""
 from dataclasses import replace
+import os
 
 import torch
 
@@ -99,6 +100,18 @@ class BatchStageVariant(torch.nn.Module):
             record_native_decoder_outputs,
             replay_native_decoder,
         )
+        if os.environ.get("VLLM_HPU_DSV41_BATCH_PROBE") == "1" and self.bucket >= 2:
+            # Direct observation, not inference: two identical prompts in one
+            # batch have identical positions and identically cleared slots, so
+            # any output difference between them is produced by something keyed
+            # on the slot index. Print what the graph is actually handed.
+            if getattr(self, "_probe_count", 0) < 40:
+                self._probe_count = getattr(self, "_probe_count", 0) + 1
+                print(f"[batch-probe] bucket={self.bucket} "
+                      f"slots={slots.tolist()} positions={positions.reshape(-1).tolist()} "
+                      f"pages_rows={[row[:4] for row in pages.tolist()]} "
+                      f"pages_identical={pages[0].tolist() == pages[1].tolist()}",
+                      flush=True)
         # Pin the shapes the compiler sees. The batch path hands positions and
         # ids in from a host-filled metadata copy, and an operand whose shape is
         # not statically declared reaches the swa index_copy_ unranked; Synapse
@@ -146,6 +159,23 @@ class BatchStageVariant(torch.nn.Module):
                                                                               slots, pages, selections, candidates,
                                                                               main_ready, index_ready)
             record_native_decoder_outputs(h, p, None)
+        if os.environ.get("VLLM_HPU_DSV41_BATCH_PROBE") == "1":
+            # Quantify the numerical difference the batch geometry introduces,
+            # rather than only detecting that an argmax diverged. `h` is the
+            # stage output, so this measures the whole forward, and bucket 1
+            # gives the serial reference for the same request.
+            if getattr(self, "_hprobe_count", 0) < 40:
+                self._hprobe_count = getattr(self, "_hprobe_count", 0) + 1
+                hf = h.float()
+                peak = float(hf.abs().max())
+                if hf.shape[0] >= 2:
+                    delta = float((hf[0] - hf[1]).abs().max())
+                    print(f"[h-probe] bucket={self.bucket} peak={peak:.6g} "
+                          f"row0_vs_row1_maxabs={delta:.6g} rel={delta / peak if peak else 0:.3g}",
+                          flush=True)
+                else:
+                    print(f"[h-probe] bucket={self.bucket} peak={peak:.6g} "
+                          f"checksum={float(hf.sum()):.8g}", flush=True)
         return h, p, None
 
 

@@ -117,18 +117,25 @@ class TwoMicrobatchPipeline:
             arguments = (ids, positions, slots, frame.pages, spans[offset:offset + len(half)])
             if model.pp_rank == 0:
                 value = model.forward_request_batch(*arguments, lane=lane)
-                frame.hidden.copy_(value["hidden_states"])
-                frame.pre.copy_(value["pre_mix"])
+                # The packet exists only to carry this stage's output across a
+                # pipeline boundary. A single-stage deployment has no peer to
+                # receive it, so packing it (and indexing ranks[1], which does
+                # not exist there) is dead work at best. Same predicate as
+                # PPBuffers.single_stage and BatchExecution._pp_stages == 1.
+                if not runner.pp.single_stage:
+                    frame.hidden.copy_(value["hidden_states"])
+                    frame.pre.copy_(value["pre_mix"])
                 frame.producer.record(compute)
                 # Ordinary decode commits one known input. The host staging
                 # slot records its actual stage consumer before another ticket
                 # is prepared; it cannot be overwritten until that event ends.
                 model.complete_request_batch([1] * len(half))
-                with torch.hpu.stream(self.stream):
-                    self.stream.wait_event(frame.producer)
-                    self.work.append(dist.isend(frame.packet, dst=pp.ranks[1], group=pp.device_group))
-                    frame.transferred.record()
-                runner.pp.sends = getattr(runner.pp, "sends", 0) + 1
+                if not runner.pp.single_stage:
+                    with torch.hpu.stream(self.stream):
+                        self.stream.wait_event(frame.producer)
+                        self.work.append(dist.isend(frame.packet, dst=pp.ranks[1], group=pp.device_group))
+                        frame.transferred.record()
+                    runner.pp.sends = getattr(runner.pp, "sends", 0) + 1
             else:
                 compute.wait_event(frame.transferred)
                 value = model.forward_request_batch(*arguments,

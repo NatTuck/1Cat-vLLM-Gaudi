@@ -185,6 +185,12 @@ def configure(config):
         enabled = next((name for name in _PIPELINE_ONLY_FASTPATHS if getattr(envs, name, False)), None)
         if enabled is not None:
             raise ValueError(f"V4.1 {enabled} requires a pipeline peer")
+        # Two owned microbatches overlap a pipeline boundary, and the second
+        # lane is the only place that samples. PP_MICROBATCHES is a count whose
+        # default of 1 is valid without a peer, so it cannot join the boolean
+        # list above, which prepare_default_fastpaths forces to "0".
+        if envs.VLLM_HPU_DSV41_PP_MICROBATCHES != 1:
+            raise ValueError("V4.1 VLLM_HPU_DSV41_PP_MICROBATCHES=2 requires a pipeline peer")
     if is_tp4(config) and envs.VLLM_HPU_DSV41_PREFILL_GROUPED_FP8 not in ("", "w13_single_bucket"):
         raise ValueError("V4.1 TP4 supports BF16 or W13 single-FP8 bucketed prefill")
     if config.scheduler_config.async_scheduling and not uses_v2(config):

@@ -133,6 +133,29 @@ class BatchExecution:
                 return True
         return False
 
+    _debug_split_warned = False
+
+    @staticmethod
+    def _debug_split(label):
+        """Diagnostic only: close the region at a named point.
+
+        Bisection instrument. The batch path once failed to compile at bucket 2
+        while bucket 1 and prefill succeeded, and the exception surfaced at the
+        first D2H copy of the step, naming no node. A synchronise after each
+        stage turns that into "which stage owns the bad node".
+
+        Costs four device synchronisations per decode step when enabled, so it
+        is a diagnostic and never a setting to leave on: warn once, loudly.
+        """
+        if os.environ.get("VLLM_HPU_DSV41_BATCH_DEBUG_SPLIT") != "1":
+            return
+        if not BatchExecution._debug_split_warned:
+            BatchExecution._debug_split_warned = True
+            logger.warning("V4.1 BATCH_DEBUG_SPLIT is enabled: four device synchronisations per decode step. "
+                           "This is a diagnostic and will wreck throughput; unset it to serve.")
+        torch.hpu.synchronize()
+        logger.info("V4.1 batch debug split completed after %s", label)
+
     def _execute(self, requests):
         if not requests or len(requests) > self.capacity:
             raise ValueError("Invalid ordinary decode request batch")
@@ -168,8 +191,25 @@ class BatchExecution:
         sent = None
         if self.model.pp_rank == 0:
             values = self.model.forward_request_batch(ids, positions, slots, pages, spans)
-            hidden.copy_(values["hidden_states"])
-            pre.copy_(values["pre_mix"])
+            self._debug_split("forward_request_batch")
+            if not single_stage:
+                # The packet exists only to carry the stage output across a
+                # pipeline boundary (dist.isend below). A single-stage
+                # deployment samples the forward's own tensors, so writing them
+                # into the packet was pure work: two copies into offset views of
+                # one int32 buffer on every decode step, whose destinations are
+                # never read. Skip them there.
+                #
+                # This also unblocks batched decode: with these two copies in
+                # place the b=2 graph was rejected with "Invalid Node Params"
+                # while b=1 compiled. Removing both fixes it. Which of the two
+                # copies Synapse rejected, and why b=2 and not b=1, is NOT
+                # established -- the offset-view shape of `pre` is equally true
+                # at b=1, so it cannot by itself explain the asymmetry. Do not
+                # treat this as a compiler workaround with a known mechanism.
+                hidden.copy_(values["hidden_states"])
+                pre.copy_(values["pre_mix"])
+                self._debug_split("batch_io")
             if single_stage:
                 # No second stage to sample: do it here, exactly as the last
                 # stage would. forward_request_batch returns an
@@ -180,6 +220,7 @@ class BatchExecution:
                     token.copy_(self.runner._sample_requests(head, requests))
                 else:
                     token.copy_(self.samplers[b](head))
+                self._debug_split("sampler_graph")
             else:
                 sent = dist.isend(packet, dst=pp.ranks[1], group=pp.device_group)
                 self.runner.pp.sends = getattr(self.runner.pp, "sends", 0) + 1
@@ -195,9 +236,13 @@ class BatchExecution:
             if self._needs_sampling(requests):
                 token.copy_(self.runner._sample_requests(values, requests))
             else:
+                # `values` is a bare hidden tensor here, not IntermediateTensors:
+                # forward_request_batch returns the record only on pp_rank 0 and
+                # the bare tensor on the last stage (models/deepseek_v41.py:391).
                 token.copy_(self.samplers[b](values))
         if not single_stage:
             pp.broadcast(token, src=1)
+        self._debug_split("sampler")
         token_host.copy_(token, non_blocking=True)
         done = torch.hpu.Event()
         done.record()
@@ -218,8 +263,11 @@ class BatchExecution:
         buckets = self.runner.audit.setdefault("batch_bucket_calls", {})
         buckets[b] = buckets.get(b, 0) + 1
         self.runner.audit["batch_padding_rows"] = self.runner.audit.get("batch_padding_rows", 0) + b - len(requests)
-        self.runner.audit["batch_pp_payload_bytes"] = (self.runner.audit.get("batch_pp_payload_bytes", 0) +
-                                                       packet.numel() * packet.element_size())
+        if not single_stage:
+            # Only count a PP payload when one is actually sent; a single-stage
+            # deployment neither fills nor transmits the packet.
+            self.runner.audit["batch_pp_payload_bytes"] = (self.runner.audit.get("batch_pp_payload_bytes", 0) +
+                                                           packet.numel() * packet.element_size())
         ids = [request.req_id for request in requests]
         return (ModelRunnerOutput(
             req_ids=ids, req_id_to_index={
@@ -235,8 +283,14 @@ class BatchExecution:
             # bucket 2 fails, and the graph dumps carry no bucket identity.
             logger.info("V4.1 PP%d batch warmup starting bucket %d (capacity %d)", self.model.pp_rank, b,
                         self.capacity)
+            # Every row gets the SAME prompt but a DISTINCT page allocation. The
+            # graph only needs to compile, and identical inputs on distinct slots
+            # are an exact instrument: rows 0..n-1 should agree, so any
+            # max|row0-rowi| is batching numerics and nothing else. With one
+            # token per row that comparison was unavailable from outside, because
+            # real serving never puts two requests at the same position.
             requests = [
-                RequestState(f"__batch_warm_{i}", [1 + i], [], None, ([1 + i], )) for i in range(min(b, self.capacity))
+                RequestState(f"__batch_warm_{i}", [1], [], None, ([1 + i], )) for i in range(min(b, self.capacity))
             ]
             for _ in range(4):
                 self.execute(requests)
