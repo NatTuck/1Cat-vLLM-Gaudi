@@ -29,7 +29,12 @@ class BatchExecution:
         # indexing ranks[1], which does not exist.
         _pp = self.runner.pp.group
         self._pp_stages = len(_pp.ranks)
-        self._last_rank = _pp.ranks[-1]
+        # get_pp_group().ranks holds *global* ranks, and a PP1 worker's group is
+        # just itself, while model.pp_rank is the PP index. Comparing the two held
+        # only on global rank 0, so ranks 1-3 built no sampler and died with
+        # KeyError on the first batch. Use the predicate the rest of the runner
+        # already uses for "this stage owns the output head".
+        self._last_stage = bool(getattr(_pp, "is_last_rank", True))
         for b in self.buckets:
             host = torch.zeros(3, b, dtype=torch.int32).pin_memory("hpu")
             meta = torch.zeros_like(host, device=self.device)
@@ -40,7 +45,7 @@ class BatchExecution:
             token = torch.zeros(b, 1, dtype=torch.int32, device=self.device)
             token_host = torch.zeros(b, 1, dtype=torch.int32).pin_memory("hpu")
             self.buffers[b] = (host, meta, pages, packet, hidden, pre, token, token_host)
-            if self.model.pp_rank == self._last_rank:
+            if self._last_stage:
                 self.samplers[b] = torch.compile(self.model.program.sample_greedy_token,
                                                  backend="hpu_backend",
                                                  fullgraph=True,
@@ -163,11 +168,14 @@ class BatchExecution:
             pre.copy_(values["pre_mix"])
             if single_stage:
                 # No second stage to sample: do it here, exactly as the last
-                # stage would.
+                # stage would. forward_request_batch returns an
+                # IntermediateTensors record on pp_rank 0 rather than the bare
+                # hidden tensor a PP2 head receives, so unwrap it first.
+                head = values["hidden_states"]
                 if self._needs_sampling(requests):
-                    token.copy_(self.runner._sample_requests(values, requests))
+                    token.copy_(self.runner._sample_requests(head, requests))
                 else:
-                    token.copy_(self.samplers[b](values))
+                    token.copy_(self.samplers[b](head))
             else:
                 sent = dist.isend(packet, dst=pp.ranks[1], group=pp.device_group)
                 self.runner.pp.sends = getattr(self.runner.pp, "sends", 0) + 1
@@ -213,7 +221,7 @@ class BatchExecution:
             req_ids=ids, req_id_to_index={
                 name: i
                 for i, name in enumerate(ids)
-            }, sampled_token_ids=outputs) if self.model.pp_rank == self._last_rank else None)
+            }, sampled_token_ids=outputs) if self._last_stage else None)
 
     def warmup(self):
         from vllm_gaudi.v1.worker.deepseek_v41_runner import RequestState
