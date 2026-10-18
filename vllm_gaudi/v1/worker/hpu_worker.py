@@ -1254,10 +1254,10 @@ class HPUWorker(WorkerBase):
         # same-named set belong to a different class). A repeat would therefore
         # re-run request_batches.warmup() and the DSpark C2-C5 inserts, which are
         # not cheap; this call site runs once, from initialize_from_config, and
-        # wake_up() does not re-enter it.
-        from vllm_gaudi.v1.worker.deepseek_v41_runner import skip_warmup_requested
-
-        self._v41_skip_warmup = skip_warmup_requested()
+        # wake_up() does not re-enter it. get_config().skip_warmup resolves
+        # VLLM_SKIP_WARMUP itself (Value derives the env name from the feature),
+        # so no deepseek_v41_runner import is needed on this generic path.
+        self._v41_skip_warmup = bool(get_config().skip_warmup)
         if not getattr(self.model_runner, "graphed_buckets", None):
             self.model_runner.warmup_model()  # type: ignore[union-attr]
         if self.model_config.hf_config.model_type == "deepseek_v41":
@@ -1290,8 +1290,20 @@ class HPUWorker(WorkerBase):
                     "reserve, and the pre-KV warmup that would have enlarged it was skipped; the reserve is "
                     "only proven after the first prefill", free_bytes, max(0, peak - resident), peak, resident,
                     working)
-        if certificate := getattr(self, "_v41_memory_certificate", None):
-            certificate.publish_after_warmup()
+        certificate = getattr(self, "_v41_memory_certificate", None)
+        if certificate is not None:
+            if self._v41_skip_warmup:
+                # The certificate's identity folds in this file's warmup sources,
+                # not the flag, so a skip run would overwrite the same
+                # rankN-<identity>.json with the smaller headroom it measured.
+                # A later normal start restores that and sizes the KV cache from
+                # it without ever running profile_run.
+                logger.warning(
+                    "V4.1 not publishing the memory certificate under VLLM_SKIP_WARMUP: its warmup "
+                    "allocations never happened, so the recorded headroom would under-measure what a "
+                    "normal start needs for the same identity")
+            else:
+                certificate.publish_after_warmup()
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)
@@ -1405,6 +1417,20 @@ class HPUWorker(WorkerBase):
                                self.rank, stats["tp4_direct_group_replays"])
             logger.info("V4.1 rank %d native decode stage executed: native_graphs=%d native_entry_replays=%d "
                         "after %d real decode step(s)", self.rank, graphs, replays, seen)
+            return
+        # A state-block rebind (ops/deepseek_v41_state.py bind -> replay_owner.close())
+        # or a move to another search geometry invalidates every captured graph,
+        # so capture restarts from zero. Count real decode steps since the last
+        # capture activity rather than since arming, or a healthy server that
+        # serves two different prompt shapes reports a false error here.
+        captures = stats.get("native_captures")
+        baseline = getattr(self, "_v41_deferred_captures", None)
+        if baseline is None:
+            # Record where capture activity started; this step still counts.
+            self._v41_deferred_captures = captures
+        elif captures is not None and captures != baseline:
+            self._v41_deferred_captures = captures
+            self._v41_deferred_decode_steps = 0
             return
         # Bounded watch: a cold group needs three real decode steps at most, so
         # prepared_group_stats() is called no more than that many times.

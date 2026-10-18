@@ -33,6 +33,7 @@ def _fake_worker(monkeypatch, *, graphs=0, replays=0, fallbacks=0, tp=4, native=
     stats = {
         "native_graphs": graphs,
         "native_entry_replays": replays,
+        "native_captures": 0,
         "tp4_direct_group_replays": fallbacks,
     }
     monkeypatch.setattr(prepared_plan, "prepared_group_stats", lambda: dict(stats))
@@ -224,3 +225,87 @@ def test_warmup_model_skip_mode_compiles_nothing_and_leaves_regions_unfrozen(mon
         assert targets and ready, "the default path still warms the decode shapes"
         assert runner.graphed_buckets == {1}
         assert frozen == [True], "the default path freezes the warmed regions"
+
+
+def test_deferred_decode_watch_restarts_when_capture_activity_advances(monkeypatch, caplog):
+    """A geometry change or state-block rebind invalidates the graphs.
+
+    Capture then restarts from zero, so the watch must count steps since the
+    last capture activity rather than since arming. Otherwise a healthy server
+    that serves two different prompt shapes reports a false failure.
+    """
+    caplog.set_level(logging.INFO)
+    worker, _, stats = _fake_worker(monkeypatch, graphs=0, replays=0)
+    worker._v41_deferred_native_decode_check = True
+    worker._v41_deferred_prefill_plan_check = False
+
+    _step(worker, decode=1)                     # arms the capture baseline
+    stats["native_captures"] = 1                # first capture, then invalidated
+    _step(worker, decode=1)
+    stats["native_graphs"] = 0
+    stats["native_captures"] = 2                # recapture for the second shape
+    _step(worker, decode=1)
+    _step(worker, decode=1)
+
+    assert not _errors(caplog), "capture activity must restart the watch, not trip it"
+    assert worker._v41_deferred_native_decode_check is True
+
+    stats["native_graphs"] = 1
+    stats["native_entry_replays"] = 1
+    _step(worker, decode=1)
+    assert worker._v41_deferred_native_decode_check is False
+
+
+def test_compiled_stage_branch_reports_tp4_and_is_quiet_elsewhere(monkeypatch, caplog):
+    """The owner-less branch: a TP4 miss is an error, other TP sizes are not."""
+    caplog.set_level(logging.INFO)
+    worker, model, _ = _fake_worker(monkeypatch, tp=4, native=False)
+    worker._v41_deferred_native_decode_check = True
+    worker._v41_deferred_prefill_plan_check = False
+    model.ordinary.audit["calls"] = 0
+    model.compiled_input_calls = 0
+    _step(worker, decode=1)
+    assert worker._v41_deferred_native_decode_check is False
+    assert len(_errors(caplog)) == 1
+    assert "TP4 compiled decode stage" in _errors(caplog)[0].getMessage()
+
+    caplog.clear()
+    worker, model, _ = _fake_worker(monkeypatch, tp=2, native=False)
+    worker._v41_deferred_native_decode_check = True
+    worker._v41_deferred_prefill_plan_check = False
+    _step(worker, decode=1)
+    assert worker._v41_deferred_native_decode_check is False
+    assert not _errors(caplog), "a non-TP4 worker has no compiled-stage assertion to report"
+    assert any("no compiled-stage assertion for TP2" in record.getMessage() for record in caplog.records)
+
+
+def test_execute_model_samples_the_audit_counters_before_the_forward_pass(monkeypatch, caplog):
+    """The wiring, not just the check: the delta must bracket the model call.
+
+    Computing audit_before after the call would make every delta zero and the
+    diagnostics silent, which no check-level test can see.
+    """
+    caplog.set_level(logging.INFO)
+    worker, model, stats = _fake_worker(monkeypatch, graphs=0, replays=0)
+    worker._v41_deferred_native_decode_check = True
+    worker._v41_deferred_prefill_plan_check = False
+    worker.step = 0
+    worker.step_debug = None
+    worker.step_profiler = None
+    worker.gc_track_recompiles = False
+    worker.model_runner.fatal_execution_errors = False
+    stats["native_graphs"] = 1
+    stats["native_entry_replays"] = 1
+
+    def execute(scheduler_output):
+        # A real decode step: the runner's counter advances inside the call.
+        worker.model_runner.audit["decode_steps"] += 1
+        return "output"
+
+    worker.model_runner.execute_model = execute
+    out = worker.execute_model(SimpleNamespace(num_scheduled_tokens={"req": 1}))
+
+    assert out == "output"
+    assert worker._v41_deferred_native_decode_check is False, (
+        "the diagnostic must observe the decode step that happened inside the call")
+    assert any("native decode stage executed" in record.getMessage() for record in caplog.records)
