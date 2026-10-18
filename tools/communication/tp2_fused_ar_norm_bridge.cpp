@@ -116,6 +116,32 @@ bool tp2ExchangeEnabled() {
   return algorithm != nullptr && std::strcmp(algorithm, "tp2-exchange") == 0;
 }
 
+// The direct-exchange row bound is owned by HCL_TP2_DIRECT_MAX_COUNT, which the
+// Python side raises to 327680 when request batching is enabled (a 64-request
+// program x 5120 hidden). Reading it here keeps the guard consistent with the
+// transport limit instead of hardcoding the single-request 32768, which rejects
+// every batched all-gather.
+int64_t tp4DirectMaxCount() {
+  // HCL_TP2_DIRECT_MAX_COUNT is only set by the TP2-exchange path (tp_size==2);
+  // on TP4 it is absent, so fall back to the batch program's own dimension.
+  const char *configured = std::getenv("HCL_TP2_DIRECT_MAX_COUNT");
+  if (configured != nullptr) {
+    char *end = nullptr;
+    const long long parsed = std::strtoll(configured, &end, 10);
+    if (end != nullptr && end != configured && parsed > 0) {
+      return parsed;
+    }
+  }
+  // With request batching the program is built for 64 requests x 5120 hidden
+  // (deepseek_v41_program.py: maximum = 64 if BATCH_DECODE else 1), so a single
+  // row can legitimately be 327680 elements.
+  const char *batched = std::getenv("VLLM_HPU_DSV41_BATCH_DECODE");
+  if (batched != nullptr && std::strcmp(batched, "1") == 0) {
+    return 64 * 5120;
+  }
+  return 32768;
+}
+
 bool profileHostStagesEnabled() {
   const char *enabled =
       std::getenv("VLLM_HPU_TP2_FUSED_AR_NORM_PROFILE_HOST_STAGES");
@@ -778,7 +804,7 @@ at::Tensor tp2ExchangePeer(c10d::ProcessGroupEagerHCCL *backend,
                     GET_ENV_FLAG_NEW(PT_HPU_EAGER_PIPELINE_ENABLE) &&
                     GET_ENV_FLAG_NEW(PT_HPU_EAGER_COLLECTIVE_PIPELINE_ENABLE),
                 "TP4 reduction requires the eager compute and collective pipelines");
-    TORCH_CHECK(partial.device().type() == at::kHPU && partial.numel() <= 32768 &&
+    TORCH_CHECK(partial.device().type() == at::kHPU && partial.numel() <= tp4DirectMaxCount() &&
                     partial.storage().data_ptr().get() != peer.storage().data_ptr().get(),
                 "TP4 reduction requires bounded activations with distinct storage");
   }

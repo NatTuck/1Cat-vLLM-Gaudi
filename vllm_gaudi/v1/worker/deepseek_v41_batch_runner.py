@@ -24,6 +24,12 @@ class BatchExecution:
         self.bank = self.model.batch_state
         self.buckets = tuple(b for b in (1, 2, 4, 8, 16, 32, 64) if b <= 1 << (capacity - 1).bit_length())
         self.buffers, self.samplers = {}, {}
+        # The batch path was written for a two-stage pipeline. Record the real
+        # shape so a single-stage (PP1) deployment samples locally instead of
+        # indexing ranks[1], which does not exist.
+        _pp = self.runner.pp.group
+        self._pp_stages = len(_pp.ranks)
+        self._last_rank = _pp.ranks[-1]
         for b in self.buckets:
             host = torch.zeros(3, b, dtype=torch.int32).pin_memory("hpu")
             meta = torch.zeros_like(host, device=self.device)
@@ -34,7 +40,7 @@ class BatchExecution:
             token = torch.zeros(b, 1, dtype=torch.int32, device=self.device)
             token_host = torch.zeros(b, 1, dtype=torch.int32).pin_memory("hpu")
             self.buffers[b] = (host, meta, pages, packet, hidden, pre, token, token_host)
-            if self.model.pp_rank == 1:
+            if self.model.pp_rank == self._last_rank:
                 self.samplers[b] = torch.compile(self.model.program.sample_greedy_token,
                                                  backend="hpu_backend",
                                                  fullgraph=True,
@@ -105,6 +111,19 @@ class BatchExecution:
             record["generation"] = self.generation
             self._request_trace.write(json.dumps(record, separators=(",", ":")) + "\n")
 
+    @staticmethod
+    def _needs_sampling(requests):
+        """True when any request asks for non-greedy sampling.
+
+        Warmup requests are built with sampling_params=None, so this must not
+        dereference the attribute blindly.
+        """
+        for request in requests:
+            params = getattr(request, "sampling_params", None)
+            if params is not None and params.temperature != 0:
+                return True
+        return False
+
     def _execute(self, requests):
         if not requests or len(requests) > self.capacity:
             raise ValueError("Invalid ordinary decode request batch")
@@ -136,12 +155,22 @@ class BatchExecution:
         ids, positions, slots = meta.unbind(0)
         torch.index_select(self.bank.pages, 0, slots.clamp_min(0).long(), out=pages)
         pp = self.runner.pp.group
+        single_stage = self._pp_stages == 1
+        sent = None
         if self.model.pp_rank == 0:
             values = self.model.forward_request_batch(ids, positions, slots, pages, spans)
             hidden.copy_(values["hidden_states"])
             pre.copy_(values["pre_mix"])
-            sent = dist.isend(packet, dst=pp.ranks[1], group=pp.device_group)
-            self.runner.pp.sends = getattr(self.runner.pp, "sends", 0) + 1
+            if single_stage:
+                # No second stage to sample: do it here, exactly as the last
+                # stage would.
+                if self._needs_sampling(requests):
+                    token.copy_(self.runner._sample_requests(values, requests))
+                else:
+                    token.copy_(self.samplers[b](values))
+            else:
+                sent = dist.isend(packet, dst=pp.ranks[1], group=pp.device_group)
+                self.runner.pp.sends = getattr(self.runner.pp, "sends", 0) + 1
         else:
             received = dist.irecv(packet, src=pp.ranks[0], group=pp.device_group)
             received.wait()
@@ -151,16 +180,17 @@ class BatchExecution:
                                                           "hidden_states": hidden,
                                                           "pre_mix": pre
                                                       }))
-            if any(req.sampling_params.temperature != 0 for req in requests):
+            if self._needs_sampling(requests):
                 token.copy_(self.runner._sample_requests(values, requests))
             else:
                 token.copy_(self.samplers[b](values))
-        pp.broadcast(token, src=1)
+        if not single_stage:
+            pp.broadcast(token, src=1)
         token_host.copy_(token, non_blocking=True)
         done = torch.hpu.Event()
         done.record()
         done.synchronize()
-        if self.model.pp_rank == 0:
+        if sent is not None:
             sent.wait()
         outputs = token_host[:len(requests)].tolist()
         self.model.complete_request_batch([1] * len(requests))
@@ -183,7 +213,7 @@ class BatchExecution:
             req_ids=ids, req_id_to_index={
                 name: i
                 for i, name in enumerate(ids)
-            }, sampled_token_ids=outputs) if self.model.pp_rank == 1 else None)
+            }, sampled_token_ids=outputs) if self.model.pp_rank == self._last_rank else None)
 
     def warmup(self):
         from vllm_gaudi.v1.worker.deepseek_v41_runner import RequestState
@@ -204,4 +234,5 @@ class BatchExecution:
                 if self.model.engram_host is not None:
                     self.model.engram_host.release_request(request.req_id)
             self.runner.graphed_buckets.add(b)
-        self.runner.pp.group.barrier()
+        if self._pp_stages > 1:
+            self.runner.pp.group.barrier()
