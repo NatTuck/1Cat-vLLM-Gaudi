@@ -343,7 +343,18 @@ class HPUWorker(WorkerBase):
                     and gaudi_envs.VLLM_HPU_DSV41_PREFILL_NATIVE_PLAN
                     and stats["prefill_plan"]["executed"]["largest_token_bucket"] < 128
                 ):
-                    raise RuntimeError("Native prefill plan was selected but startup did not execute it")
+                    if getattr(self, "_v41_skip_warmup", False):
+                        # VLLM_SKIP_WARMUP deliberately executes no prefill at
+                        # startup, so readiness cannot be asserted here. Keep the
+                        # safety net by re-checking after the first real prefill
+                        # of >=128 tokens in execute_model.
+                        self._v41_deferred_prefill_plan_check = True
+                        logger.warning(
+                            "V4.1 rank %d native prefill plan was selected but no >=128-token prefill ran at "
+                            "startup (VLLM_SKIP_WARMUP); deferring the readiness assertion to the first real "
+                            "prefill", self.rank)
+                    else:
+                        raise RuntimeError("Native prefill plan was selected but startup did not execute it")
                 owner = self.model_runner.model.program.replay_owner
                 batch_owner = getattr(self.model_runner.model, "batch_replay", None)
                 if batch_owner is not None:
@@ -448,13 +459,27 @@ class HPUWorker(WorkerBase):
                 if phase == "ready":
                     if owner is not None:
                         if not stats["native_graphs"] or not stats["native_entry_replays"]:
-                            raise RuntimeError("Startup never executed its complete native decode stage")
+                            if getattr(self, "_v41_skip_warmup", False):
+                                # No decode stage ran at startup on purpose.
+                                # Re-check after the first real decode step.
+                                self._v41_deferred_native_decode_check = True
+                                logger.warning(
+                                    "V4.1 rank %d executed no native decode stage at startup (VLLM_SKIP_WARMUP); "
+                                    "deferring the readiness assertion to the first real decode step", self.rank)
+                            else:
+                                raise RuntimeError("Startup never executed its complete native decode stage")
                         if stats["tp4_direct_group_replays"]:
                             raise RuntimeError("Native stage startup used a per-group decode fallback")
                     elif self.parallel_config.tensor_parallel_size == 4 and (
                         not stats["compiled_stage"]["calls"] or not stats["compiled_input_calls"]
                     ):
-                        raise RuntimeError("TP4 startup never executed its compiled decode stage")
+                        if getattr(self, "_v41_skip_warmup", False):
+                            self._v41_deferred_native_decode_check = True
+                            logger.warning(
+                                "V4.1 rank %d executed no compiled decode stage at startup (VLLM_SKIP_WARMUP); "
+                                "deferring the readiness assertion to the first real decode step", self.rank)
+                        else:
+                            raise RuntimeError("TP4 startup never executed its compiled decode stage")
                 stats["moe"] = {
                     "n256_fp8_decode": gaudi_envs.VLLM_HPU_DSV41_EXPERT_N256_FP8,
                     "fused_quant": gaudi_envs.VLLM_HPU_DSV41_EXPERT_FUSED_QUANT,
@@ -1222,7 +1247,17 @@ class HPUWorker(WorkerBase):
             from vllm_gaudi.ops.deepseek_v4_config import bind_worker_cpu
 
             bind_worker_cpu(self.rank)
-        # Don't run the warmup if the model is already warmed up
+        # Don't run the warmup if the model is already warmed up. Under
+        # VLLM_SKIP_WARMUP the runner still runs warmup_model but leaves
+        # graphed_buckets empty, and this guard is the only reader of that set
+        # (V41ModelRunner has no base class, so hpu_model_runner's uses of a
+        # same-named set belong to a different class). A repeat would therefore
+        # re-run request_batches.warmup() and the DSpark C2-C5 inserts, which are
+        # not cheap; this call site runs once, from initialize_from_config, and
+        # wake_up() does not re-enter it.
+        from vllm_gaudi.v1.worker.deepseek_v41_runner import skip_warmup_requested
+
+        self._v41_skip_warmup = skip_warmup_requested()
         if not getattr(self.model_runner, "graphed_buckets", None):
             self.model_runner.warmup_model()  # type: ignore[union-attr]
         if self.model_config.hf_config.model_type == "deepseek_v41":
@@ -1235,6 +1270,26 @@ class HPUWorker(WorkerBase):
                 raise RuntimeError("Completed V4.1 warmup leaves insufficient serving working memory: "
                                    f"{free_bytes} available, {working} required; retain context/shape capacity "
                                    "and correct the allocation budget before advertising API readiness")
+            if working and getattr(self, "_v41_skip_warmup", False):
+                # The reserve is unchanged in kind: serving_workspace_reserve is
+                # max(configured, profile_peak - profile_resident) from
+                # determine_available_memory, not a warmup product. Skipping the
+                # pre-KV warmup shrinks that measured headroom while the KV pool
+                # grows, so this admission is optimistic: the prefill workspaces,
+                # replay snapshots and region executors warmup would have
+                # allocated are now materialised on the first request. The check
+                # is kept (it still rejects gross overcommit) but a pass no
+                # longer proves the reserve survives the first prefill.
+                profile = getattr(self.model_runner, "profile_memory", None) or {}
+                peak = int(profile.get("peak_bytes", 0))
+                resident = int(profile.get("resident_bytes", 0))
+                logger.warning(
+                    "V4.1 ready memory admission is optimistic under VLLM_SKIP_WARMUP: free_bytes=%d excludes "
+                    "the serving prefill workspaces and replay snapshots that warmup would have allocated; "
+                    "profile_headroom_bytes=%d (peak %d - resident %d) is the term that set the %d-byte serving "
+                    "reserve, and the pre-KV warmup that would have enlarged it was skipped; the reserve is "
+                    "only proven after the first prefill", free_bytes, max(0, peak - resident), peak, resident,
+                    working)
         if certificate := getattr(self, "_v41_memory_certificate", None):
             certificate.publish_after_warmup()
         # Reset the seed to ensure that the random state is not affected by
@@ -1265,6 +1320,105 @@ class HPUWorker(WorkerBase):
             return guard_async(execute_guarded(self.model_runner.sample_tokens, grammar_output, phase="sampling"))
         return self.model_runner.sample_tokens(grammar_output)  # type: ignore[union-attr]
 
+    # A cold native group prepares on the first real decode step, captures on the
+    # second and replays on the third, so the deferred decode diagnostic watches
+    # exactly that many steps and then stops.
+    _V41_DEFERRED_DECODE_WATCH_STEPS = 3
+
+    def _v41_audit_counters(self):
+        """Real-request step counters; dummy, profile and warmup runs do not count."""
+        audit = getattr(self.model_runner, "audit", None) or {}
+        return int(audit.get("prefill_steps", 0)), int(audit.get("decode_steps", 0))
+
+    def _v41_deferred_diagnostics(self, scheduler_output, before):
+        """Report the readiness invariants that VLLM_SKIP_WARMUP deferred.
+
+        Called after the guarded model call, outside the fail-closed path, so it
+        must never raise: a raise here can leave peer ranks waiting on the next
+        collective (ops/deepseek_v41_failure.py uses fail_worker/os._exit for
+        exactly that reason). Every branch logs and disarms instead.
+        """
+        try:
+            prefill_before, decode_before = before
+            prefill_steps, decode_steps = self._v41_audit_counters()
+            scheduled = max((getattr(scheduler_output, "num_scheduled_tokens", None) or {}).values(), default=0)
+            # A real prefill step, not merely a short scheduled count: a chunked
+            # prompt tail of 1-6 tokens is a prefill and must not be read as a
+            # decode step.
+            if (getattr(self, "_v41_deferred_prefill_plan_check", False)
+                    and prefill_steps > prefill_before and scheduled >= 128):
+                self._check_deferred_prefill_plan()
+            if decode_steps > decode_before:
+                self._v41_deferred_decode_steps = getattr(self, "_v41_deferred_decode_steps", 0) + (
+                    decode_steps - decode_before)
+                if getattr(self, "_v41_deferred_native_decode_check", False):
+                    self._check_deferred_native_decode()
+        except Exception:
+            logger.exception("V4.1 rank %d stopped the deferred VLLM_SKIP_WARMUP diagnostics", self.rank)
+            self._v41_deferred_prefill_plan_check = False
+            self._v41_deferred_native_decode_check = False
+
+    def _check_deferred_prefill_plan(self):
+        """Report the deferred startup prefill-plan invariant after first use."""
+        from vllm_gaudi.ops.deepseek_v41_prefill_plan import prefill_plan_stats
+
+        self._v41_deferred_prefill_plan_check = False
+        executed = prefill_plan_stats()["executed"]
+        if executed["largest_token_bucket"] < 128:
+            logger.error("V4.1 rank %d executed a real >=128-token prefill but the native prefill plan never "
+                         "ran it (largest executed bucket %d); VLLM_SKIP_WARMUP could not assert this at "
+                         "readiness", self.rank, executed["largest_token_bucket"])
+            return
+        logger.info("V4.1 rank %d native prefill plan executed on the first real prefill: %s", self.rank, executed)
+
+    def _check_deferred_native_decode(self):
+        """Report the deferred startup decode-stage invariant after first use."""
+        runner = self.model_runner
+        seen = getattr(self, "_v41_deferred_decode_steps", 0)
+        owner = getattr(getattr(runner.model, "program", None), "replay_owner", None)
+        if getattr(runner.model, "batch_replay", None) is not None:
+            owner = runner.model.batch_replay
+        if owner is None:
+            calls = runner.model.ordinary.audit["calls"]
+            inputs = runner.model.compiled_input_calls
+            self._v41_deferred_native_decode_check = False
+            if self.parallel_config.tensor_parallel_size != 4:
+                logger.info("V4.1 rank %d compiled decode stage: calls=%d input_calls=%d after %d real decode "
+                            "step(s) (no compiled-stage assertion for TP%d)", self.rank, calls, inputs, seen,
+                            self.parallel_config.tensor_parallel_size)
+            elif not calls or not inputs:
+                logger.error("V4.1 rank %d ran %d real decode step(s) but the TP4 compiled decode stage has "
+                             "calls=%d input_calls=%d; VLLM_SKIP_WARMUP could not assert this at readiness",
+                             self.rank, seen, calls, inputs)
+            else:
+                logger.info("V4.1 rank %d compiled decode stage executed: calls=%d input_calls=%d after %d real "
+                            "decode step(s)", self.rank, calls, inputs, seen)
+            return
+        from vllm_gaudi.ops.tp2_prepared_plan import prepared_group_stats
+
+        stats = prepared_group_stats()
+        graphs, replays = stats["native_graphs"], stats["native_entry_replays"]
+        if graphs and replays:
+            self._v41_deferred_native_decode_check = False
+            if stats["tp4_direct_group_replays"]:
+                logger.warning("V4.1 rank %d native decode used the per-group fallback %d time(s)",
+                               self.rank, stats["tp4_direct_group_replays"])
+            logger.info("V4.1 rank %d native decode stage executed: native_graphs=%d native_entry_replays=%d "
+                        "after %d real decode step(s)", self.rank, graphs, replays, seen)
+            return
+        # Bounded watch: a cold group needs three real decode steps at most, so
+        # prepared_group_stats() is called no more than that many times.
+        if seen >= self._V41_DEFERRED_DECODE_WATCH_STEPS:
+            self._v41_deferred_native_decode_check = False
+            logger.error("V4.1 rank %d ran %d real decode step(s) without a complete native decode stage: "
+                         "native_graphs=%d native_entry_replays=%d; VLLM_SKIP_WARMUP could not assert this at "
+                         "readiness", self.rank, seen, graphs, replays)
+            return
+        if seen >= 2 and not graphs:
+            self._v41_deferred_native_decode_check = False
+            logger.error("V4.1 rank %d ran %d real decode step(s) without capturing a native decode graph; "
+                         "VLLM_SKIP_WARMUP could not assert this at readiness", self.rank, seen)
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -1274,6 +1428,9 @@ class HPUWorker(WorkerBase):
             self.step_debug(f"step={self.step}")
         if self.step_profiler and self.step == self.profile_steps[0]:
             self.step_profiler.start()
+        deferred = bool(getattr(self, "_v41_deferred_prefill_plan_check", False)
+                        or getattr(self, "_v41_deferred_native_decode_check", False))
+        audit_before = self._v41_audit_counters() if deferred else None
         with track_graph_compile("HPUWorker.execute_model") if self.gc_track_recompiles else contextlib.nullcontext():
             if getattr(self.model_runner, "fatal_execution_errors", False):
                 from vllm_gaudi.ops.deepseek_v41_failure import execute_guarded, guard_async
@@ -1283,6 +1440,8 @@ class HPUWorker(WorkerBase):
                 )
             else:
                 output = self.model_runner.execute_model(scheduler_output)  # type: ignore[union-attr]
+        if deferred:
+            self._v41_deferred_diagnostics(scheduler_output, audit_before)
         # TODO(woosuk): Send the output to the engine process.
         if self.step_profiler:
             if self.step >= self.profile_steps[0]:

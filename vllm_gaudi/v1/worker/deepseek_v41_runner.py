@@ -23,6 +23,7 @@ from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 from vllm_gaudi import envs
+from vllm_gaudi.extension.runtime import get_config
 from vllm_gaudi.extension.logger import logger as init_logger
 from vllm_gaudi.extension.profiler import HabanaHighLevelProfiler
 from vllm_gaudi.ops.deepseek_v41_config import decode_source_prefix_bound, select_native_warmup_geometries
@@ -55,6 +56,21 @@ VERIFY_METADATA_SIZE = 7
 VERIFY_PROPOSED_SIZE = 5
 VERIFY_CONTROL_SIZE = VERIFY_METADATA_SIZE + VERIFY_PROPOSED_SIZE
 PREFILL_BLOCK_TOKENS = DEFAULT_PREFILL_TOKENS
+
+
+def skip_warmup_requested():
+    """VLLM_SKIP_WARMUP as resolved by the runtime config.
+
+    Value.__call__ (extension/config.py) applies the env override before the
+    declared dependency, and Value derives env_var 'VLLM_SKIP_WARMUP' from the
+    feature name because features.py:118 passes none; its boolean parser accepts
+    1/true/t/yes/y/on. Config.get memoises each attribute and finalize_config()
+    forces them all, so the value is settled before the worker starts - it is,
+    from the launcher environment. Reading the raw variable here as well would
+    invert that precedence, so a user-flags file could no longer turn the mode
+    off.
+    """
+    return bool(get_config().skip_warmup)
 
 
 class DraftContextPlans:
@@ -3129,7 +3145,13 @@ class V41ModelRunner:
             logger.info("V4.1 initialization memory step: %s", record)
 
         record_memory(0, 0)
-        if not self.use_dspark and isinstance(self.state, PagedStageState):
+        # VLLM_SKIP_WARMUP: skip the pre-KV recipe warmup. Compiles then happen on
+        # the first request that needs each shape, which is the normal trade when
+        # iterating or when the persistent recipe cache is already populated. The
+        # C1 memory profile below is NOT skipped: it sizes the KV cache.
+        skip_warmup = skip_warmup_requested()
+        if (not self.use_dspark and isinstance(self.state, PagedStageState)
+                and not skip_warmup):
             cases = [(start, count) for start in (0, min(INDEX_MME_HOT_TOKENS,
                                                        self.model_config.max_model_len - 1))
                      for count in prefill_compute_buckets(self.prefill_capacity)
@@ -3162,10 +3184,34 @@ class V41ModelRunner:
 
     @torch.inference_mode()
     def warmup_model(self):
+        # Skip the shape warmups when asked; compiles then happen on the first
+        # request that needs each shape. This matters most with prefix caching,
+        # whose serving-prefill warmup walks long-context positions.
+        skip_warmup = skip_warmup_requested()
+        warmed, skipped = [], []
+        if skip_warmup:
+            # State exactly what still runs in this mode: the sampling protocol,
+            # batch decode (VLLM_HPU_DSV41_BATCH_DECODE) and the DSpark pre-KV
+            # profile plus its C2-C5 insert shapes are not compile sweeps of the
+            # serving shapes, so they are kept.
+            kept = ["sampling_protocol"]
+            if self.request_batches is not None:
+                kept.append("batch_decode")
+            if self.use_dspark:
+                kept += ["dspark_pre_kv_profile", "dspark_insert_shapes"]
+            logger.info(
+                "V4.1 PP%s TP%s VLLM_SKIP_WARMUP is active: prefill, recipe and decode/search-geometry warmups "
+                "are skipped and compile on first use; still running: %s", getattr(self.model, "pp_rank", "?"),
+                getattr(self.model, "tp_rank", "?"), ", ".join(kept))
         if self.request_batches is not None:
             self.request_batches.warmup()
             self.model.batch_state.restore_single_bindings()
-        if getattr(self, "prefix_checkpoints", None) is not None:
+            warmed.append("batch_decode")
+        if (not skip_warmup and getattr(self, "prefix_checkpoints", None) is not None):
+            # The handoff warmup only executes the short-prefix codecs: it
+            # publishes pages for a temporary slot, binds it, then retires it,
+            # so no serving state survives. _bind_request repeats the same
+            # transition for every real request.
             self.model.batch_state.warmup_single_handoff(self.state.blocks)
             # Profile-time pages are replaced by the scheduler pool before
             # this entry. Warm the actual serving tensor contracts, including
@@ -3186,7 +3232,11 @@ class V41ModelRunner:
             finally:
                 bank.restore_single_bindings()
                 bank.release(owner)
-        if getattr(self, "prefix_checkpoints", None) is not None and self.prefill_capacity > 8192:
+            warmed.append("serving_prefill_search")
+        elif getattr(self, "prefix_checkpoints", None) is not None:
+            skipped.append("serving_prefill_search")
+        if (not skip_warmup and getattr(self, "prefix_checkpoints", None) is not None
+                and self.prefill_capacity > 8192):
             from vllm_gaudi.ops.deepseek_v41_prefix_state import InlinePrefixCapture
 
             bank, program = self.model.batch_state, self.model.program
@@ -3210,6 +3260,9 @@ class V41ModelRunner:
                 bank.restore_single_bindings()
                 bank.release(owner)
             self.state.clear()
+            warmed.append("inline_prefix_capture")
+        elif getattr(self, "prefix_checkpoints", None) is not None and self.prefill_capacity > 8192:
+            skipped.append("inline_prefix_capture")
         # Ordinary serving keeps the qualified C1 native replay for decode.
         # C6 is a DSpark-only anchor-plus-draft geometry. Prompt C128 recipes
         # are compiled by real prefill qualification and persisted in cache.
@@ -3225,6 +3278,12 @@ class V41ModelRunner:
                           if runtime or paged_dspark else ((0, 512), ))
             additional = getattr(getattr(self, "vllm_config", None), "additional_config", {}) or {}
             geometries = select_native_warmup_geometries(geometries, additional)
+            if skip_warmup:
+                # Nothing was captured, so the bucket stays out of
+                # graphed_buckets and its readiness is not asserted; the first
+                # decode request builds the variant for its own geometry.
+                skipped.append("C%d_decode_search(%d)" % (count, len(geometries)))
+                continue
             logger.info("V4.1 C%d native warmup searches: %s", count, [search for _, search in geometries])
             for start_position, search in geometries:
                 for _ in range(4 if self.model.native else 1):
@@ -3232,6 +3291,7 @@ class V41ModelRunner:
                 if self.model.native:
                     self.model.program.replay_owner.require_ready(count, search=search)
             self.graphed_buckets.add(count)
+            warmed.append("C%d_decode_search(%d)" % (count, len(geometries)))
         if (
             not self.use_dspark
             and self.model.native
@@ -3241,23 +3301,33 @@ class V41ModelRunner:
             # Prepare every reachable C1 search geometry before API readiness.
             # Otherwise a healthy stream pauses for compilation at each new
             # bucket, and already-warmed buckets remain untested at startup.
-            for start, search in decode_search_warmups(
+            searches = [(start, search) for start, search in decode_search_warmups(
                 self.model.program.length, runtime_indexer=getattr(self.model.program, "runtime_indexer", False),
                 native_visible_prefixes=True
-            ):
-                if start == 0:
-                    continue
-                logger.info("V4.1 PP%d preparing C1 search bucket %d", self.model.pp_rank, search)
-                for _ in range(4):
-                    self._dummy_run(1, native=True, start_position=start)
-                self.model.program.replay_owner.require_ready(1, search=search)
+            ) if start != 0]
+            if skip_warmup:
+                # Four dummy C1 runs per bucket made this the dominant startup
+                # cost; each bucket now compiles on the first request that
+                # reaches it.
+                skipped.append("C1_search_buckets(%d)" % len(searches))
+            else:
+                for start, search in searches:
+                    logger.info("V4.1 PP%d preparing C1 search bucket %d", self.model.pp_rank, search)
+                    for _ in range(4):
+                        self._dummy_run(1, native=True, start_position=start)
+                    self.model.program.replay_owner.require_ready(1, search=search)
+                warmed.append("C1_search_buckets(%d)" % len(searches))
         if self.use_dspark and isinstance(self.state, PagedStageState):
             # Exercise the first real indexer/head exchange before advertising
             # API readiness. This is one boundary warmup, not a length sweep.
-            for _ in range(4 if self.model.native else 1):
-                self._dummy_run(6, native=self.model.native, start_position=512)
-            if self.model.native:
-                self.model.program.replay_owner.require_ready(6, search=1024)
+            if skip_warmup:
+                skipped.append("dspark_c6_boundary")
+            else:
+                for _ in range(4 if self.model.native else 1):
+                    self._dummy_run(6, native=self.model.native, start_position=512)
+                if self.model.native:
+                    self.model.program.replay_owner.require_ready(6, search=1024)
+                warmed.append("dspark_c6_boundary")
         if envs.VLLM_HPU_DSV41_DSPARK and self.pp.group.is_last_rank:
             # A verify may commit any prefix, not just the C1/C6 target buckets.
             # Compile those real shapes before serving; the common state clear
@@ -3268,15 +3338,29 @@ class V41ModelRunner:
         logger.info("V4.1 starting sampling protocol preparation")
         self._warm_device_round_inputs()
         logger.info("V4.1 sampling protocol preparation complete")
+        warmed.append("sampling_protocol")
         self.pp.group.barrier()
         self.state.clear()
         self.active_request = None
         if getattr(self, "prefix_checkpoints", None) is not None:
             from vllm_gaudi.ops.deepseek_v41_prefill_regions import freeze_prefill_regions
 
-            freeze_prefill_regions()
-            # Inline capture preserves complete tiles; other checkpoint cuts
-            # reuse the finite prefill buckets already warmed above.
+            if skip_warmup:
+                # The freeze exists to keep an unseen shape eager instead of
+                # compiling inside a request. That is only safe when the shapes
+                # were warmed; with warmup skipped almost nothing is compiled
+                # yet, so freezing here would make prompt shapes eager for the
+                # whole process lifetime. This mode promises "compiles on first
+                # use", so leave the regions unfrozen.
+                skipped.append("freeze_prefill_regions")
+            else:
+                freeze_prefill_regions()
+                # Inline capture preserves complete tiles; other checkpoint cuts
+                # reuse the finite prefill buckets already warmed above.
+                warmed.append("freeze_prefill_regions")
+        logger.info("V4.1 PP%s TP%s warmup summary (VLLM_SKIP_WARMUP=%s): ran=[%s] skipped=[%s]",
+                    getattr(self.model, "pp_rank", "?"), getattr(self.model, "tp_rank", "?"),
+                    "1" if skip_warmup else "0", ", ".join(warmed) or "none", ", ".join(skipped) or "none")
         if envs.VLLM_HPU_DSV41_VERIFY_TIMING:
             direct_commit = (self.pp.single_stage
                              or (envs.VLLM_HPU_DSV41_PP_DIRECT_EXCHANGE and envs.VLLM_HPU_DSV41_INLINE_PP_COMMIT
