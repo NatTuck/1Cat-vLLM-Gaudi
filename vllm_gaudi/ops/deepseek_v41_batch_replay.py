@@ -99,6 +99,13 @@ class BatchStageVariant(torch.nn.Module):
             record_native_decoder_outputs,
             replay_native_decoder,
         )
+        # Pin the shapes the compiler sees. The batch path hands positions and
+        # ids in from a host-filled metadata copy, and an operand whose shape is
+        # not statically declared reaches the swa index_copy_ unranked; Synapse
+        # then rejects the node with "Invalid Node Params" naming nothing useful.
+        # The bucket is fixed per variant, so reshaping is free and exact.
+        positions = positions.reshape(self.bucket)
+        ids = ids.reshape(self.bucket)
         roots = dict(hidden_states=hidden,
                      pre_mix=pre,
                      positions=positions,

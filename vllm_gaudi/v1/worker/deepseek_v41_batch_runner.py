@@ -11,6 +11,10 @@ import torch
 from vllm_gaudi.ops.deepseek_v41_batch_input import fill_request_metadata
 import torch.distributed as dist
 
+from vllm_gaudi.extension.logger import logger as init_logger
+
+logger = init_logger()
+
 from vllm.sequence import IntermediateTensors
 from vllm.v1.outputs import ModelRunnerOutput
 
@@ -226,6 +230,11 @@ class BatchExecution:
     def warmup(self):
         from vllm_gaudi.v1.worker.deepseek_v41_runner import RequestState
         for b in self.buckets:
+            # Mark the bucket boundary in the log so a compile failure can be
+            # attributed to the graph that produced it: bucket 1 succeeds and
+            # bucket 2 fails, and the graph dumps carry no bucket identity.
+            logger.info("V4.1 PP%d batch warmup starting bucket %d (capacity %d)", self.model.pp_rank, b,
+                        self.capacity)
             requests = [
                 RequestState(f"__batch_warm_{i}", [1 + i], [], None, ([1 + i], )) for i in range(min(b, self.capacity))
             ]
