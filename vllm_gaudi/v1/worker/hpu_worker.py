@@ -679,6 +679,18 @@ class HPUWorker(WorkerBase):
             from vllm_gaudi.ops.deepseek_v41_native_trace import disable_automatic_graph_exports
 
             disable_automatic_graph_exports()
+        elif is_v41(self.vllm_config) and os.environ.get("VLLM_TORCH_PROFILER_DIR"):
+            # Same hazard as the raw path, and not covered by the gate above:
+            # enabling the profiler makes SDK startup enable full graph JSON
+            # export to its own default directory. On a host where that path is
+            # read-only the *compile* fails with synStatus 26 ("failed to write
+            # file: <home>/.habana/post_graph/<pid>") at the first op, which
+            # looks like a broken kernel and is not one. Redirecting with
+            # GRAPH_VISUALIZATION covers the post-graph key only; the SDK also
+            # writes pre-graphs to the same default root, so clear both.
+            from vllm_gaudi.ops.deepseek_v41_native_trace import disable_automatic_graph_exports
+
+            disable_automatic_graph_exports()
 
     def _create_model_runner(self):
         from vllm_gaudi.ops.deepseek_v41_config import is_v41
