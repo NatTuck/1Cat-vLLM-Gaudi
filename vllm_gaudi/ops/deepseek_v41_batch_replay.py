@@ -5,6 +5,8 @@ import os
 
 import torch
 
+from vllm_gaudi.ops.deepseek_v41_trace import host_span
+
 from vllm_gaudi.models.deepseek_v41_batch_program import CompiledBatchStage
 from vllm_gaudi.ops.deepseek_v41_replay import _Metadata
 from vllm_gaudi.ops.deepseek_v41_reindex_compact import bounded_reindex_bucket
@@ -152,12 +154,17 @@ class BatchStageVariant(torch.nn.Module):
                            attention_inputs=self.attention_inputs)
         with collect_prepared_group_replays(owner=self, adapter=self.adapter, snapshot=self.snapshot,
                                             **fixed_roots) as context:
-            for index, chunk in enumerate(self.compiled.chunks):
-                context["group_index"] = index
-                h, p, selections, candidates, main_ready, index_ready = chunk(h, p, positions, ids,
-                                                                              self.attention_inputs[:self.engram_count],
-                                                                              slots, pages, selections, candidates,
-                                                                              main_ready, index_ready)
+            # HOST span 2 of 2 (see notes/step-head-attribution.md). Wraps the loop that CALLS the
+            # compiled chunks, so it brackets their submission and any guard evaluation between
+            # them without entering a compiled region. A no-op unless a profiler is active.
+            with host_span("v41::batch_step::chunk_loop"):
+                for index, chunk in enumerate(self.compiled.chunks):
+                    context["group_index"] = index
+                    h, p, selections, candidates, main_ready, index_ready = chunk(
+                        h, p, positions, ids,
+                        self.attention_inputs[:self.engram_count],
+                        slots, pages, selections, candidates,
+                        main_ready, index_ready)
             record_native_decoder_outputs(h, p, None)
         if os.environ.get("VLLM_HPU_DSV41_BATCH_PROBE") == "1":
             # Quantify the numerical difference the batch geometry introduces,

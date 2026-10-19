@@ -8,6 +8,8 @@ import time
 
 import torch
 
+from vllm_gaudi.ops.deepseek_v41_trace import host_span
+
 from vllm_gaudi.ops.deepseek_v41_batch_input import fill_request_metadata
 import torch.distributed as dist
 
@@ -181,14 +183,19 @@ class BatchExecution:
                                for owner, req in zip(owners, requests))
             with torch.profiler.record_function(f"v41::batch_slots::generation{self.generation}::{mapping}"):
                 pass
-        host, meta, pages, packet, hidden, pre, token, token_host = self.buffers[b]
-        fill_request_metadata(host, requests, owners, input_ids=(span[2][0] for span in spans))
-        meta.copy_(host, non_blocking=True)
-        ids, positions, slots = meta.unbind(0)
-        torch.index_select(self.bank.pages, 0, slots.clamp_min(0).long(), out=pages)
-        pp = self.runner.pp.group
-        single_stage = self._pp_stages == 1
-        sent = None
+        # HOST span 1 of 2 (see notes/step-head-attribution.md). Everything after the
+        # last_done.synchronize() above and before the first chunk submission: the buffer unpack,
+        # fill_request_metadata, the meta H2D, the pages index_select. A no-op unless a profiler is
+        # active, and outside any compiled region.
+        with host_span("v41::batch_step::pre_submit"):
+            host, meta, pages, packet, hidden, pre, token, token_host = self.buffers[b]
+            fill_request_metadata(host, requests, owners, input_ids=(span[2][0] for span in spans))
+            meta.copy_(host, non_blocking=True)
+            ids, positions, slots = meta.unbind(0)
+            torch.index_select(self.bank.pages, 0, slots.clamp_min(0).long(), out=pages)
+            pp = self.runner.pp.group
+            single_stage = self._pp_stages == 1
+            sent = None
         if self.model.pp_rank == 0:
             values = self.model.forward_request_batch(ids, positions, slots, pages, spans)
             self._debug_split("forward_request_batch")

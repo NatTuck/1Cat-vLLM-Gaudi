@@ -64,6 +64,11 @@ if TYPE_CHECKING:
     VLLM_HPU_DSV41_BATCH_MAIN_FUSIONS: bool = False
     VLLM_HPU_DSV41_BATCH_C1_NUMERICS: bool = False
     VLLM_HPU_DSV41_MHC_BATCH_REUSE: bool = False
+    # DIAGNOSTIC ONLY. Take the batch path (forward_batch) for a ONE-request batch, which is
+    # bucket 1 by construction, so the batch implementation can be compared against the C1
+    # path at the same row count. Off by default; it changes which implementation serves a
+    # single request, so it is a probe, not a serving configuration.
+    VLLM_HPU_DSV41_BATCH_FORCE_SINGLE: bool = False
     VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH: bool = False
     VLLM_HPU_DSV41_MHC_CONTROL_MME: bool = True
     VLLM_HPU_DSV41_DSPARK_BF16_PROJECTIONS: bool = False
@@ -1068,6 +1073,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     lambda: os.getenv("VLLM_HPU_DSV41_MHC_CONTROL_PREFETCH", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_MHC_BATCH_REUSE":
     lambda: os.getenv("VLLM_HPU_DSV41_MHC_BATCH_REUSE", "0").lower() in ("1", "true"),
+    "VLLM_HPU_DSV41_BATCH_FORCE_SINGLE":
+    lambda: os.getenv("VLLM_HPU_DSV41_BATCH_FORCE_SINGLE", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR":
     lambda: os.getenv("VLLM_HPU_DSV41_BATCH_COMPRESSOR_PAIR", "0").lower() in ("1", "true"),
     "VLLM_HPU_DSV41_BATCH_COMPRESSOR_GATHER":

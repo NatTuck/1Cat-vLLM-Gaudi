@@ -2194,7 +2194,12 @@ class V41ModelRunner:
                 for name, count in scheduled.num_scheduled_tokens.items()
                 if count == 1 and self.requests[name].num_computed_tokens >= self.requests[name].decode_start
             ]
-            if batch_requests and (len(scheduled.num_scheduled_tokens) > 1 or operations is not None):
+            # VLLM_HPU_DSV41_BATCH_FORCE_SINGLE is a DIAGNOSTIC probe (envs.py): it lets a
+            # one-request batch take the batch path, which is bucket 1 by construction because
+            # _execute computes b = 1 << (len(requests) - 1).bit_length(). Off by default.
+            if batch_requests and (len(scheduled.num_scheduled_tokens) > 1
+                                   or operations is not None
+                                   or envs.VLLM_HPU_DSV41_BATCH_FORCE_SINGLE):
                 self._next_input = None
                 result = self.request_batches.execute(batch_requests)
                 batched_ids = {request.req_id for request in batch_requests}

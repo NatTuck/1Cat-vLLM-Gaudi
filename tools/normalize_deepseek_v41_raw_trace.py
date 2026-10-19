@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import resource
 import shutil
 from pathlib import Path
 import subprocess
@@ -166,10 +167,23 @@ def resolve_recipe_starts(pending, names, recipe_ids_at_start, observed_recipe_i
     return recipe_starts, unresolved_recipe_starts
 
 
+def raise_file_limit():
+    """The offline parser keeps one descriptor open per captured debug-info blob (~3,100 of them on
+    a batched decode capture). With the common soft RLIMIT_NOFILE of 1024 it dies with "Too many
+    open files", which also breaks its own log-file open and surfaces as a misleading
+    "could not open file ..._dbg.bin". Raise the soft limit here so the child inherits it."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    ceiling = hard if hard != resource.RLIM_INFINITY else 1 << 20
+    target = min(ceiling, 1 << 16)
+    if soft < target:
+        resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+
+
 def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap_ms=50, csv_source=None,
               *, required_engines=("TPC", "MME"), decode_roi_padding_ms=None, decode_position_window=None):
     if not required_engines or not set(required_engines) <= {"TPC", "MME", "DMA"}:
         raise ValueError("Declare at least one supported engine required by this capture")
+    raise_file_limit()
     subprocess.run([sys.executable, str(Path(__file__).with_name("extract_deepseek_v41_trace.py")),
                     str(cpu_trace), "--output", str(output)], check=True, stdout=subprocess.DEVNULL)
     inventory_path = output / "inventory.json"
@@ -253,7 +267,19 @@ def normalize(bundle, cpu_trace, metadata, output, config, chunk_ms=200, overlap
     parse_config_path = output / "offline-parser-config.json"
     parse_config_path.write_text(json.dumps(parse_config, indent=2) + "\n")
     environment = dict(os.environ)
-    environment["LD_LIBRARY_PATH"] = "/usr/lib/habanatools/habana_plugins:/usr/lib/habanalabs"
+    # The offline parser dlopens libhw_trace.so and friends. The plugin directory is not in the
+    # same place on every image: the vLLM/gaudi containers ship it under /opt/habanalabs, while
+    # some wheels expect /usr/lib/habanatools. Probe both instead of hardcoding one, because a
+    # hardcoded miss fails as "error while loading shared libraries: libhw_trace.so: cannot open
+    # shared object file", which reads like a broken install rather than a path bug.
+    plugin_dirs = [str(path) for path in (Path("/opt/habanalabs/habana_plugins"),
+                                          Path("/usr/lib/habanatools/habana_plugins"))
+                   if (path / "libhw_trace.so").is_file()]
+    if not plugin_dirs:
+        raise RuntimeError("no directory containing libhw_trace.so found; synprof_parser cannot "
+                           "parse without the profiler plugins (checked /opt/habanalabs/"
+                           "habana_plugins and /usr/lib/habanatools/habana_plugins)")
+    environment["LD_LIBRARY_PATH"] = ":".join([*plugin_dirs, "/usr/lib/habanalabs"])
     calibrations = [die for item in state["host_device_time_diff"] for die in item["die"]]
     low = min(item["first"]["host"] for item in calibrations)
     high = max(item["second"]["host"] for item in calibrations)
